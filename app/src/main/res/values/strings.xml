@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">NexGo</string>
+    <string name="channels_title">Canales</string>
+    <string name="add_playlist">Agregar lista M3U</string>
+    <string name="playlist_url_hint">URL de tu lista M3U/M3U8</string>
+    <string name="load">Cargar</string>
+    <string name="loading">Cargando lista de canales…</string>
+    <string name="no_channels">No hay canales cargados todavía.</string>
+    <string name="live">EN VIVO</string>
+    <string name="fullscreen">PANTALLA COMPLETA</string>
+    <string name="error_loading">No se pudo cargar la lista. Revisa la URL o tu conexión.</string>
+</resources>
