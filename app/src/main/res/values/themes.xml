@@ -1,0 +1,7 @@
+<resources>
+    <style name="Theme.NexGo" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/nexgo_bg</item>
+        <item name="android:statusBarColor">@color/nexgo_bg</item>
+        <item name="android:navigationBarColor">@color/nexgo_bg</item>
+    </style>
+</resources>
