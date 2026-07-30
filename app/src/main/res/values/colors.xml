@@ -1,0 +1,9 @@
+<resources>
+    <color name="nexgo_bg">#0B1220</color>
+    <color name="nexgo_surface">#131C2E</color>
+    <color name="nexgo_primary">#2FD3E0</color>
+    <color name="nexgo_primary_dark">#1AA5B0</color>
+    <color name="nexgo_accent">#7C5CFF</color>
+    <color name="nexgo_text">#F5F7FA</color>
+    <color name="nexgo_text_dim">#93A1B5</color>
+</resources>
