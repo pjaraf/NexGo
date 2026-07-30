@@ -1,11 +1,14 @@
 package com.nexgo.iptv
 
 import android.os.Bundle
+import android.view.LayoutInflater
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -22,6 +25,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
@@ -42,6 +48,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun NexGoApp() {
     val context = LocalContext.current
@@ -55,8 +62,22 @@ fun NexGoApp() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showAddPlaylistDialog by remember { mutableStateOf(false) }
     var playlistUrlField by remember { mutableStateOf("") }
+    var isFullscreen by remember { mutableStateOf(false) }
 
-    // Al iniciar, intenta cargar la última lista guardada
+    val activity = context as? ComponentActivity
+    LaunchedEffect(isFullscreen) {
+        val window = activity?.window ?: return@LaunchedEffect
+        val controller = WindowCompat.getInsetsController(window, window.decorView)
+        if (isFullscreen) {
+            controller.hide(WindowInsetsCompat.Type.systemBars())
+            controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else {
+            controller.show(WindowInsetsCompat.Type.systemBars())
+        }
+    }
+
+    BackHandler(enabled = isFullscreen) { isFullscreen = false }
+
     LaunchedEffect(Unit) {
         val savedUrl = repository.getSavedPlaylistUrl()
         if (!savedUrl.isNullOrBlank()) {
@@ -101,36 +122,46 @@ fun NexGoApp() {
             .fillMaxSize()
             .background(Color(0xFF0B1220))
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            TopBar(onAddPlaylistClick = { showAddPlaylistDialog = true })
-
-            val groups = remember(channels) { channels.map { it.group }.distinct() }
-            if (groups.isNotEmpty()) {
-                CategoryTabs(
-                    groups = groups,
-                    selected = selectedGroup,
-                    onSelect = { selectedGroup = it }
-                )
+        if (isFullscreen && selectedChannel != null) {
+            Box(modifier = Modifier.fillMaxSize()) {
+                VideoPlayer(streamUrl = selectedChannel!!.streamUrl)
             }
+        } else {
+            Column(modifier = Modifier.fillMaxSize()) {
+                TopBar(onAddPlaylistClick = { showAddPlaylistDialog = true })
 
-            Row(modifier = Modifier.fillMaxSize()) {
-                ChannelList(
-                    channels = channels.filter { selectedGroup == null || it.group == selectedGroup },
-                    selectedChannel = selectedChannel,
-                    onChannelSelected = { selectedChannel = it },
-                    modifier = Modifier
-                        .width(320.dp)
-                        .fillMaxHeight()
-                )
+                val groups = remember(channels) { channels.map { it.group }.distinct() }
+                if (groups.isNotEmpty()) {
+                    CategoryTabs(
+                        groups = groups,
+                        selected = selectedGroup,
+                        onSelect = { selectedGroup = it }
+                    )
+                }
 
-                PlayerPanel(
-                    channel = selectedChannel,
-                    isLoading = isLoading,
-                    errorMessage = errorMessage,
-                    modifier = Modifier
-                        .weight(1f)
-                        .fillMaxHeight()
-                )
+                Row(modifier = Modifier.fillMaxSize()) {
+                    ChannelList(
+                        channels = channels.filter { selectedGroup == null || it.group == selectedGroup },
+                        selectedChannel = selectedChannel,
+                        onChannelSelected = { selectedChannel = it },
+                        onChannelDoubleClick = { channel ->
+                            selectedChannel = channel
+                            isFullscreen = true
+                        },
+                        modifier = Modifier
+                            .width(320.dp)
+                            .fillMaxHeight()
+                    )
+
+                    PlayerPanel(
+                        channel = selectedChannel,
+                        isLoading = isLoading,
+                        errorMessage = errorMessage,
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                    )
+                }
             }
         }
     }
@@ -189,11 +220,13 @@ private fun CategoryTabs(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun ChannelList(
     channels: List<Channel>,
     selectedChannel: Channel?,
     onChannelSelected: (Channel) -> Unit,
+    onChannelDoubleClick: (Channel) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier.background(Color(0xFF0B1220))) {
@@ -214,7 +247,8 @@ private fun ChannelList(
                     ChannelRow(
                         channel = channel,
                         isSelected = channel.id == selectedChannel?.id,
-                        onClick = { onChannelSelected(channel) }
+                        onClick = { onChannelSelected(channel) },
+                        onDoubleClick = { onChannelDoubleClick(channel) }
                     )
                 }
             }
@@ -222,15 +256,21 @@ private fun ChannelList(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun ChannelRow(channel: Channel, isSelected: Boolean, onClick: () -> Unit) {
+private fun ChannelRow(
+    channel: Channel,
+    isSelected: Boolean,
+    onClick: () -> Unit,
+    onDoubleClick: () -> Unit
+) {
     val background = if (isSelected) Color(0xFF2FD3E0).copy(alpha = 0.18f) else Color.Transparent
     Row(
         modifier = Modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
             .background(background)
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onDoubleClick = onDoubleClick)
             .padding(horizontal = 16.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -317,11 +357,13 @@ private fun VideoPlayer(streamUrl: String) {
     }
 
     AndroidView(
-        factory = {
-            PlayerView(it).apply {
-                player = exoPlayer
-                useController = true
-            }
+        factory = { ctx ->
+            val playerView = LayoutInflater.from(ctx).inflate(R.layout.exo_player_view, null) as PlayerView
+            playerView.player = exoPlayer
+            playerView
+        },
+        update = { playerView ->
+            playerView.player = exoPlayer
         },
         modifier = Modifier.fillMaxSize()
     )
