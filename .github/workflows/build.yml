@@ -1,0 +1,35 @@
+name: Build NexGo APK
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar código del repositorio
+        uses: actions/checkout@v4
+
+      - name: Configurar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Generar el Gradle Wrapper
+        run: gradle wrapper --gradle-version 8.7
+
+      - name: Dar permisos de ejecución a gradlew
+        run: chmod +x ./gradlew
+
+      - name: Compilar APK de debug
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Subir APK como artefacto descargable
+        uses: actions/upload-artifact@v4
+        with:
+          name: NexGo-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
