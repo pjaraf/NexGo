@@ -1,9 +1,13 @@
 package com.nexgo.iptv.data
 
 import com.nexgo.iptv.model.Channel
+import java.io.Reader
 
 /**
- * Parser simple para listas M3U/M3U8 con extensión EXTINF (formato IPTV estándar).
+ * Parser en streaming para listas M3U/M3U8 con extensión EXTINF (formato IPTV
+ * estándar). Lee línea por línea directo desde la conexión de red, en vez de
+ * cargar el archivo completo en un solo String gigante primero (importante
+ * para listas de decenas de miles de canales, para no quedarse sin memoria).
  *
  * Ejemplo de entrada soportada:
  *
@@ -15,36 +19,29 @@ object M3UParser {
 
     private val attrRegex = Regex("""([a-zA-Z-]+)="([^"]*)"""")
 
-    fun parse(content: String): List<Channel> {
-        val lines = content.lineSequence()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .toList()
-
+    fun parse(reader: Reader): List<Channel> {
         val channels = mutableListOf<Channel>()
         var pendingName: String? = null
         var pendingGroup = "General"
         var pendingLogo: String? = null
         var autoId = 0
 
-        for (line in lines) {
+        reader.forEachLine { rawLine ->
+            val line = rawLine.trim()
             when {
-                line.startsWith("#EXTM3U") -> continue
+                line.isEmpty() -> Unit
+                line.startsWith("#EXTM3U") -> Unit
 
                 line.startsWith("#EXTINF") -> {
                     val attrs = attrRegex.findAll(line).associate { it.groupValues[1] to it.groupValues[2] }
                     pendingGroup = attrs["group-title"]?.takeIf { it.isNotBlank() } ?: "General"
                     pendingLogo = attrs["tvg-logo"]
-                    // El nombre del canal va después de la última coma de la línea EXTINF
                     pendingName = line.substringAfterLast(",").trim().ifBlank { "Canal ${autoId + 1}" }
                 }
 
-                line.startsWith("#") -> {
-                    // Otras directivas (#EXTGRP, #EXTVLCOPT, etc.) se ignoran por ahora
-                }
+                line.startsWith("#") -> Unit
 
                 else -> {
-                    // Línea de URL del stream
                     val name = pendingName ?: "Canal ${autoId + 1}"
                     autoId += 1
                     channels += Channel(
