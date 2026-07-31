@@ -4,7 +4,6 @@ import android.content.Context
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import com.nexgo.iptv.model.Channel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
@@ -15,7 +14,7 @@ import java.util.concurrent.TimeUnit
 private val Context.dataStore by preferencesDataStore(name = "nexgo_prefs")
 private val PLAYLIST_URL_KEY = stringPreferencesKey("playlist_url")
 
-class PlaylistRepository(private val context: Context) {
+class PlaylistRepository(private val context: Context, private val db: ChannelDatabase) {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
@@ -31,11 +30,12 @@ class PlaylistRepository(private val context: Context) {
     }
 
     /**
-     * Descarga y parsea la lista M3U/M3U8 indicada, leyendo en streaming
-     * directamente desde la conexión (sin cargar el archivo completo en un
-     * solo String), para soportar listas muy grandes sin quedarse sin memoria.
+     * Descarga y parsea la lista M3U/M3U8, guardando los canales directo en
+     * la base de datos en bloques (nunca se mantiene la lista completa en
+     * RAM). Devuelve la cantidad total de canales cargados.
      */
-    suspend fun loadChannels(url: String): List<Channel> = withContext(Dispatchers.IO) {
+    suspend fun loadChannels(url: String): Int = withContext(Dispatchers.IO) {
+        db.clear()
         val request = Request.Builder().url(url).build()
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
@@ -43,7 +43,7 @@ class PlaylistRepository(private val context: Context) {
             }
             val body = response.body ?: throw IllegalStateException("Respuesta vacía")
             body.charStream().use { stream ->
-                M3UParser.parse(stream)
+                M3UParser.parse(stream) { batch -> db.insertBatch(batch) }
             }
         }
     }
