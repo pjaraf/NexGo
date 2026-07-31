@@ -351,24 +351,41 @@ private fun TopBar(onAddPlaylistClick: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun CategoryTabs(
     groups: List<String>,
     selected: String?,
     onSelect: (String) -> Unit
 ) {
-    ScrollableTabRow(
-        selectedTabIndex = groups.indexOf(selected).coerceAtLeast(0),
-        containerColor = Color(0xFF0B1220),
-        contentColor = Color(0xFF2FD3E0),
-        edgePadding = 16.dp
+    // LazyRow en vez de ScrollableTabRow: con miles de categorías, ScrollableTabRow
+    // intenta componer TODAS las pestañas de una sola vez (aunque no se vean en
+    // pantalla), lo cual puede reventar la memoria. LazyRow solo dibuja las que
+    // están visibles, igual que hace la lista de canales.
+    androidx.compose.foundation.lazy.LazyRow(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Color(0xFF0B1220))
+            .padding(vertical = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(horizontal = 16.dp)
     ) {
-        groups.forEach { group ->
-            Tab(
-                selected = group == selected,
-                onClick = { onSelect(group) },
-                text = { Text(group) }
-            )
+        items(groups, key = { it }) { group ->
+            val isSelected = group == selected
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(if (isSelected) Color(0xFF2FD3E0).copy(alpha = 0.18f) else Color(0xFF131C2E))
+                    .combinedClickable(onClick = { onSelect(group) }, onDoubleClick = {})
+                    .padding(horizontal = 16.dp, vertical = 8.dp)
+            ) {
+                Text(
+                    text = group,
+                    color = if (isSelected) Color(0xFF2FD3E0) else Color(0xFF93A1B5),
+                    fontSize = 14.sp,
+                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                )
+            }
         }
     }
 }
