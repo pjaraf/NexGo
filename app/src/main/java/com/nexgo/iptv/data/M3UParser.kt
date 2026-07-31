@@ -7,8 +7,8 @@ import java.io.Reader
  * Parser en streaming para listas M3U/M3U8 con extensión EXTINF (formato IPTV
  * estándar). Lee línea por línea directo desde la conexión de red y entrega
  * los canales en BLOQUES PEQUEÑOS mediante onBatch, en vez de acumular una
- * lista gigante en memoria. Así, listas de cientos de miles de canales no
- * revientan la RAM: cada bloque se guarda en disco (SQLite) y se descarta.
+ * lista gigante en memoria. Además pone un tope máximo de seguridad
+ * (MAX_CHANNELS) para nunca quedarse sin memoria.
  *
  * Ejemplo de entrada soportada:
  *
@@ -19,7 +19,8 @@ import java.io.Reader
 object M3UParser {
 
     private val attrRegex = Regex("""([a-zA-Z-]+)="([^"]*)"""")
-    private const val BATCH_SIZE = 300
+    private const val BATCH_SIZE = 200
+    private const val MAX_CHANNELS = 30_000
 
     fun parse(reader: Reader, onBatch: (List<Channel>) -> Unit): Int {
         val batch = mutableListOf<Channel>()
@@ -29,6 +30,7 @@ object M3UParser {
         var totalCount = 0
 
         reader.forEachLine { rawLine ->
+            if (totalCount >= MAX_CHANNELS) return@forEachLine
             val line = rawLine.trim()
             when {
                 line.isEmpty() -> Unit
