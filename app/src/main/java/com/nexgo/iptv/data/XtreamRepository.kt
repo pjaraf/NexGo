@@ -27,21 +27,19 @@ data class XtreamCredentials(
 
 /**
  * Cliente para paneles IPTV tipo "Xtream Codes": conecta con usuario + contraseña +
- * URL del servidor y trae la lista de canales en vivo vía su API JSON
- * (player_api.php).
- *
- * IMPORTANTE: algunos paneles tienen decenas de miles de canales, y el JSON puede
- * pesar varios MB. Por eso NO se carga la respuesta completa en un solo String
- * (eso duplica/triplica el uso de memoria y puede tirar OutOfMemoryError). En vez
- * de eso, se parsea en "streaming" con JsonReader, token por token, directo desde
- * la conexión de red.
+ * URL del servidor, y guarda los canales directo en la base de datos (SQLite)
+ * en bloques pequeños a medida que los va leyendo del JSON, en vez de
+ * acumular una lista completa en memoria RAM. Así soporta paneles con
+ * decenas o cientos de miles de canales sin quedarse sin memoria.
  */
-class XtreamRepository(private val context: Context) {
+class XtreamRepository(private val context: Context, private val db: ChannelDatabase) {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
+
+    private val batchSize = 300
 
     suspend fun getSavedCredentials(): XtreamCredentials? {
         val prefs = context.xtreamDataStore.data.first()
@@ -73,7 +71,8 @@ class XtreamRepository(private val context: Context) {
         return url.trimEnd('/')
     }
 
-    suspend fun loadChannels(credentials: XtreamCredentials): List<Channel> = withContext(Dispatchers.IO) {
+    /** Devuelve la cantidad total de canales cargados. */
+    suspend fun loadChannels(credentials: XtreamCredentials): Int = withContext(Dispatchers.IO) {
         val base = normalizeServerUrl(credentials.serverUrl)
         val user = credentials.username.trim()
         val pass = credentials.password.trim()
@@ -120,10 +119,13 @@ class XtreamRepository(private val context: Context) {
             // Si el panel no expone categorías, seguimos sin agrupar
         }
 
-        // 3) Canales en vivo, en streaming (esta es la parte que puede ser enorme)
+        // 3) Canales en vivo, guardados directo en la base de datos en bloques
+        db.clear()
         val streamsUrl = "$base/player_api.php?username=$user&password=$pass&action=get_live_streams"
         val streamsRequest = Request.Builder().url(streamsUrl).build()
-        val channels = mutableListOf<Channel>()
+        var totalCount = 0
+        val batch = mutableListOf<Channel>()
+
         client.newCall(streamsRequest).execute().use { response ->
             if (!response.isSuccessful) {
                 throw IllegalStateException("HTTP ${response.code} al pedir los canales")
@@ -149,13 +151,18 @@ class XtreamRepository(private val context: Context) {
                         }
                         reader.endObject()
                         if (!streamId.isNullOrBlank()) {
-                            channels += Channel(
+                            totalCount += 1
+                            batch += Channel(
                                 id = streamId,
                                 name = name ?: "Canal $streamId",
                                 group = categoryNames[categoryId] ?: "General",
                                 logoUrl = logo,
                                 streamUrl = "$base/live/$user/$pass/$streamId.m3u8"
                             )
+                            if (batch.size >= batchSize) {
+                                db.insertBatch(batch.toList())
+                                batch.clear()
+                            }
                         }
                     }
                     reader.endArray()
@@ -163,11 +170,15 @@ class XtreamRepository(private val context: Context) {
             }
         }
 
-        if (channels.isEmpty()) {
+        if (batch.isNotEmpty()) {
+            db.insertBatch(batch.toList())
+        }
+
+        if (totalCount == 0) {
             throw IllegalStateException("No se encontraron canales para esta cuenta")
         }
 
-        channels
+        totalCount
     }
 }
 
