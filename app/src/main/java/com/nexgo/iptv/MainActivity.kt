@@ -6,10 +6,15 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import java.io.File
+import java.io.PrintWriter
+import java.io.StringWriter
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -41,6 +46,7 @@ import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        installCrashLogger(this)
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
@@ -48,6 +54,27 @@ class MainActivity : ComponentActivity() {
                 NexGoApp()
             }
         }
+    }
+}
+
+private fun crashLogFile(context: android.content.Context) = File(context.filesDir, "nexgo_last_crash.txt")
+
+/**
+ * Guarda cualquier error no controlado en un archivo interno en vez de dejar que
+ * el sistema simplemente cierre la app sin explicación. La próxima vez que se
+ * abra la app, se muestra ese error en pantalla para poder diagnosticarlo.
+ */
+private fun installCrashLogger(context: android.content.Context) {
+    val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
+    Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+        try {
+            val sw = StringWriter()
+            throwable.printStackTrace(PrintWriter(sw))
+            crashLogFile(context).writeText(sw.toString())
+        } catch (_: Exception) {
+            // Si ni siquiera se puede guardar el log, no hay más remedio
+        }
+        previousHandler?.uncaughtException(thread, throwable)
     }
 }
 
@@ -68,6 +95,11 @@ fun NexGoApp() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showAddPlaylistDialog by remember { mutableStateOf(false) }
     var isFullscreen by remember { mutableStateOf(false) }
+    var lastCrashText by remember {
+        mutableStateOf(
+            crashLogFile(context).let { file -> if (file.exists()) file.readText() else null }
+        )
+    }
 
     // Campos del formulario de conexión
     var loginMode by remember { mutableStateOf(LoginMode.XTREAM) }
@@ -198,6 +230,38 @@ fun NexGoApp() {
                 }
             }
         }
+    }
+
+    if (lastCrashText != null) {
+        AlertDialog(
+            onDismissRequest = {},
+            title = { Text("La app se cerró la última vez") },
+            text = {
+                Column {
+                    Text(
+                        "Este es el error exacto. Puedes tomar captura de pantalla y compartirlo:",
+                        color = Color(0xFF93A1B5),
+                        fontSize = 13.sp
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        lastCrashText ?: "",
+                        color = Color(0xFFFF6B6B),
+                        fontSize = 11.sp,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 320.dp)
+                            .verticalScroll(rememberScrollState())
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    crashLogFile(context).delete()
+                    lastCrashText = null
+                }) { Text("Entendido") }
+            }
+        )
     }
 
     if (showAddPlaylistDialog) {
@@ -396,23 +460,54 @@ private fun PlayerPanel(
 @Composable
 private fun VideoPlayer(streamUrl: String) {
     val context = LocalContext.current
+    var playerError by remember(streamUrl) { mutableStateOf<String?>(null) }
+
     val exoPlayer = remember(streamUrl) {
-        ExoPlayer.Builder(context).build().apply {
-            setMediaItem(MediaItem.fromUri(streamUrl))
-            prepare()
-            playWhenReady = true
+        try {
+            ExoPlayer.Builder(context).build().apply {
+                addListener(object : androidx.media3.common.Player.Listener {
+                    override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                        playerError = "No se pudo reproducir este canal (${error.errorCodeName})."
+                    }
+                })
+                setMediaItem(MediaItem.fromUri(streamUrl))
+                prepare()
+                playWhenReady = true
+            }
+        } catch (e: Exception) {
+            playerError = "No se pudo iniciar el reproductor: ${e.message}"
+            null
         }
     }
 
     DisposableEffect(exoPlayer) {
-        onDispose { exoPlayer.release() }
+        onDispose { exoPlayer?.release() }
     }
+
+    if (playerError != null) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Text(playerError ?: "", color = Color(0xFFFF6B6B), modifier = Modifier.padding(16.dp))
+        }
+        return
+    }
+
+    if (exoPlayer == null) return
 
     AndroidView(
         factory = { ctx ->
-            val playerView = LayoutInflater.from(ctx).inflate(R.layout.exo_player_view, null) as PlayerView
-            playerView.player = exoPlayer
-            playerView
+            try {
+                val playerView = LayoutInflater.from(ctx)
+                    .inflate(R.layout.exo_player_view, null) as PlayerView
+                playerView.player = exoPlayer
+                playerView
+            } catch (e: Exception) {
+                // Respaldo si el layout no cargó bien: reproductor básico sin ese XML,
+                // así la app no se cierra aunque el video se vea sin recorte de esquinas.
+                PlayerView(ctx).apply {
+                    player = exoPlayer
+                    useController = true
+                }
+            }
         },
         update = { playerView ->
             playerView.player = exoPlayer
