@@ -29,8 +29,9 @@ data class XtreamCredentials(
  * Cliente para paneles IPTV tipo "Xtream Codes": conecta con usuario + contraseña +
  * URL del servidor, y guarda los canales directo en la base de datos (SQLite)
  * en bloques pequeños a medida que los va leyendo del JSON, en vez de
- * acumular una lista completa en memoria RAM. Así soporta paneles con
- * decenas o cientos de miles de canales sin quedarse sin memoria.
+ * acumular una lista completa en memoria RAM. Además pone un tope máximo de
+ * seguridad (maxChannels) para garantizar que nunca se quede sin memoria sin
+ * importar cuán gigante sea la lista del proveedor.
  */
 class XtreamRepository(private val context: Context, private val db: ChannelDatabase) {
 
@@ -39,7 +40,9 @@ class XtreamRepository(private val context: Context, private val db: ChannelData
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    private val batchSize = 300
+    private val batchSize = 200
+    private val maxChannels = 30_000
+    private val maxCategories = 5_000
 
     suspend fun getSavedCredentials(): XtreamCredentials? {
         val prefs = context.xtreamDataStore.data.first()
@@ -86,7 +89,7 @@ class XtreamRepository(private val context: Context, private val db: ChannelData
             }
         }
 
-        // 2) Categorías (para agrupar), en streaming
+        // 2) Categorías (para agrupar), en streaming, con tope de seguridad
         val categoryNames = mutableMapOf<String, String>()
         try {
             val categoriesUrl = "$base/player_api.php?username=$user&password=$pass&action=get_live_categories"
@@ -96,7 +99,8 @@ class XtreamRepository(private val context: Context, private val db: ChannelData
                     response.body?.charStream()?.use { stream ->
                         JsonReader(stream).use { reader ->
                             reader.beginArray()
-                            while (reader.hasNext()) {
+                            var catCount = 0
+                            while (reader.hasNext() && catCount < maxCategories) {
                                 reader.beginObject()
                                 var id: String? = null
                                 var name: String? = null
@@ -109,8 +113,8 @@ class XtreamRepository(private val context: Context, private val db: ChannelData
                                 }
                                 reader.endObject()
                                 if (id != null) categoryNames[id] = name ?: "General"
+                                catCount++
                             }
-                            reader.endArray()
                         }
                     }
                 }
@@ -119,7 +123,8 @@ class XtreamRepository(private val context: Context, private val db: ChannelData
             // Si el panel no expone categorías, seguimos sin agrupar
         }
 
-        // 3) Canales en vivo, guardados directo en la base de datos en bloques
+        // 3) Canales en vivo, guardados directo en la base de datos en bloques,
+        // con tope máximo de seguridad para nunca quedarse sin memoria
         db.clear()
         val streamsUrl = "$base/player_api.php?username=$user&password=$pass&action=get_live_streams"
         val streamsRequest = Request.Builder().url(streamsUrl).build()
@@ -134,7 +139,7 @@ class XtreamRepository(private val context: Context, private val db: ChannelData
             body.charStream().use { stream ->
                 JsonReader(stream).use { reader ->
                     reader.beginArray()
-                    while (reader.hasNext()) {
+                    while (reader.hasNext() && totalCount < maxChannels) {
                         reader.beginObject()
                         var streamId: String? = null
                         var name: String? = null
@@ -165,7 +170,9 @@ class XtreamRepository(private val context: Context, private val db: ChannelData
                             }
                         }
                     }
-                    reader.endArray()
+                    // Si el servidor tiene más canales de los que importamos (maxChannels),
+                    // simplemente dejamos de leer aquí; no hace falta consumir el resto
+                    // del stream ni cerrar el array, se descarta la conexión al salir del "use".
                 }
             }
         }
