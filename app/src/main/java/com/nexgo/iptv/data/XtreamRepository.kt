@@ -25,24 +25,33 @@ data class XtreamCredentials(
     val password: String
 )
 
+data class XtreamCategory(
+    val id: String,
+    val name: String
+)
+
 /**
  * Cliente para paneles IPTV tipo "Xtream Codes": conecta con usuario + contraseña +
- * URL del servidor, y guarda los canales directo en la base de datos (SQLite)
- * en bloques pequeños a medida que los va leyendo del JSON, en vez de
- * acumular una lista completa en memoria RAM. Además pone un tope máximo de
- * seguridad (maxChannels) para garantizar que nunca se quede sin memoria sin
- * importar cuán gigante sea la lista del proveedor.
+ * URL del servidor.
+ *
+ * IMPORTANTE (arreglo de fondo): en vez de descargar TODOS los canales del
+ * panel de una sola vez (lo cual además de reventar memoria en paneles
+ * grandes, no garantiza que cada categoría tenga sus canales si el total se
+ * corta en algún límite), esta versión:
+ *   1) Al conectar, solo trae la LISTA DE CATEGORÍAS (liviana).
+ *   2) Cuando el usuario toca una categoría, recién ahí se piden SOLO los
+ *      canales de esa categoría puntual (usando el parámetro category_id de
+ *      la API de Xtream), que además es mucho más rápido.
  */
-class XtreamRepository(private val context: Context, private val db: ChannelDatabase) {
+class XtreamRepository(private val context: Context) {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .build()
 
-    private val batchSize = 200
-    private val maxChannels = 30_000
-    private val maxCategories = 5_000
+    private val maxCategories = 2_000
+    private val maxChannelsPerCategory = 5_000
 
     suspend fun getSavedCredentials(): XtreamCredentials? {
         val prefs = context.xtreamDataStore.data.first()
@@ -74,64 +83,77 @@ class XtreamRepository(private val context: Context, private val db: ChannelData
         return url.trimEnd('/')
     }
 
-    /** Devuelve la cantidad total de canales cargados. */
-    suspend fun loadChannels(credentials: XtreamCredentials): Int = withContext(Dispatchers.IO) {
-        val base = normalizeServerUrl(credentials.serverUrl)
-        val user = credentials.username.trim()
-        val pass = credentials.password.trim()
+    /** Trae solo la lista de categorías/grupos (liviano, rápido). */
+    suspend fun loadCategories(credentials: XtreamCredentials): List<XtreamCategory> =
+        withContext(Dispatchers.IO) {
+            val base = normalizeServerUrl(credentials.serverUrl)
+            val user = credentials.username.trim()
+            val pass = credentials.password.trim()
 
-        // 1) Validar servidor/credenciales con una petición liviana
-        val authUrl = "$base/player_api.php?username=$user&password=$pass"
-        val authRequest = Request.Builder().url(authUrl).build()
-        client.newCall(authRequest).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IllegalStateException("Servidor o credenciales inválidas (HTTP ${response.code})")
+            // Validar servidor/credenciales
+            val authUrl = "$base/player_api.php?username=$user&password=$pass"
+            val authRequest = Request.Builder().url(authUrl).build()
+            client.newCall(authRequest).execute().use { response ->
+                if (!response.isSuccessful) {
+                    throw IllegalStateException("Servidor o credenciales inválidas (HTTP ${response.code})")
+                }
             }
-        }
 
-        // 2) Categorías (para agrupar), en streaming, con tope de seguridad
-        val categoryNames = mutableMapOf<String, String>()
-        try {
+            val categories = mutableListOf<XtreamCategory>()
             val categoriesUrl = "$base/player_api.php?username=$user&password=$pass&action=get_live_categories"
             val request = Request.Builder().url(categoriesUrl).build()
             client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    response.body?.charStream()?.use { stream ->
-                        JsonReader(stream).use { reader ->
-                            reader.beginArray()
-                            var catCount = 0
-                            while (reader.hasNext() && catCount < maxCategories) {
-                                reader.beginObject()
-                                var id: String? = null
-                                var name: String? = null
-                                while (reader.hasNext()) {
-                                    when (reader.nextName()) {
-                                        "category_id" -> id = reader.nextFlexibleString()
-                                        "category_name" -> name = reader.nextFlexibleString()
-                                        else -> reader.skipValue()
-                                    }
+                if (!response.isSuccessful) {
+                    throw IllegalStateException("HTTP ${response.code} al pedir las categorías")
+                }
+                val body = response.body ?: throw IllegalStateException("Respuesta vacía")
+                body.charStream().use { stream ->
+                    JsonReader(stream).use { reader ->
+                        reader.beginArray()
+                        var count = 0
+                        while (reader.hasNext() && count < maxCategories) {
+                            reader.beginObject()
+                            var id: String? = null
+                            var name: String? = null
+                            while (reader.hasNext()) {
+                                when (reader.nextName()) {
+                                    "category_id" -> id = reader.nextFlexibleString()
+                                    "category_name" -> name = reader.nextFlexibleString()
+                                    else -> reader.skipValue()
                                 }
-                                reader.endObject()
-                                if (id != null) categoryNames[id] = name ?: "General"
-                                catCount++
                             }
+                            reader.endObject()
+                            if (!id.isNullOrBlank()) {
+                                categories += XtreamCategory(id, name ?: "Categoría $id")
+                            }
+                            count++
                         }
                     }
                 }
             }
-        } catch (_: Exception) {
-            // Si el panel no expone categorías, seguimos sin agrupar
+
+            if (categories.isEmpty()) {
+                throw IllegalStateException("No se encontraron categorías para esta cuenta")
+            }
+
+            categories
         }
 
-        // 3) Canales en vivo, guardados directo en la base de datos en bloques,
-        // con tope máximo de seguridad para nunca quedarse sin memoria
-        db.clear()
-        val streamsUrl = "$base/player_api.php?username=$user&password=$pass&action=get_live_streams"
-        val streamsRequest = Request.Builder().url(streamsUrl).build()
-        var totalCount = 0
-        val batch = mutableListOf<Channel>()
+    /** Trae solo los canales de UNA categoría puntual. */
+    suspend fun loadChannelsForCategory(
+        credentials: XtreamCredentials,
+        category: XtreamCategory
+    ): List<Channel> = withContext(Dispatchers.IO) {
+        val base = normalizeServerUrl(credentials.serverUrl)
+        val user = credentials.username.trim()
+        val pass = credentials.password.trim()
 
-        client.newCall(streamsRequest).execute().use { response ->
+        val streamsUrl =
+            "$base/player_api.php?username=$user&password=$pass&action=get_live_streams&category_id=${category.id}"
+        val request = Request.Builder().url(streamsUrl).build()
+        val channels = mutableListOf<Channel>()
+
+        client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 throw IllegalStateException("HTTP ${response.code} al pedir los canales")
             }
@@ -139,53 +161,37 @@ class XtreamRepository(private val context: Context, private val db: ChannelData
             body.charStream().use { stream ->
                 JsonReader(stream).use { reader ->
                     reader.beginArray()
-                    while (reader.hasNext() && totalCount < maxChannels) {
+                    var count = 0
+                    while (reader.hasNext() && count < maxChannelsPerCategory) {
                         reader.beginObject()
                         var streamId: String? = null
                         var name: String? = null
-                        var categoryId: String? = null
                         var logo: String? = null
                         while (reader.hasNext()) {
                             when (reader.nextName()) {
                                 "stream_id" -> streamId = reader.nextFlexibleString()
                                 "name" -> name = reader.nextFlexibleString()
-                                "category_id" -> categoryId = reader.nextFlexibleString()
                                 "stream_icon" -> logo = reader.nextFlexibleString()
                                 else -> reader.skipValue()
                             }
                         }
                         reader.endObject()
                         if (!streamId.isNullOrBlank()) {
-                            totalCount += 1
-                            batch += Channel(
+                            channels += Channel(
                                 id = streamId,
                                 name = name ?: "Canal $streamId",
-                                group = categoryNames[categoryId] ?: "General",
+                                group = category.name,
                                 logoUrl = logo,
                                 streamUrl = "$base/live/$user/$pass/$streamId.m3u8"
                             )
-                            if (batch.size >= batchSize) {
-                                db.insertBatch(batch.toList())
-                                batch.clear()
-                            }
                         }
+                        count++
                     }
-                    // Si el servidor tiene más canales de los que importamos (maxChannels),
-                    // simplemente dejamos de leer aquí; no hace falta consumir el resto
-                    // del stream ni cerrar el array, se descarta la conexión al salir del "use".
                 }
             }
         }
 
-        if (batch.isNotEmpty()) {
-            db.insertBatch(batch.toList())
-        }
-
-        if (totalCount == 0) {
-            throw IllegalStateException("No se encontraron canales para esta cuenta")
-        }
-
-        totalCount
+        channels
     }
 }
 
