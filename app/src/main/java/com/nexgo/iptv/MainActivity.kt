@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -39,6 +40,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.nexgo.iptv.data.ChannelDatabase
 import com.nexgo.iptv.data.PlaylistRepository
+import com.nexgo.iptv.data.XtreamCategory
 import com.nexgo.iptv.data.XtreamCredentials
 import com.nexgo.iptv.data.XtreamRepository
 import com.nexgo.iptv.model.Channel
@@ -62,11 +64,6 @@ class MainActivity : ComponentActivity() {
 
 private fun crashLogFile(context: android.content.Context) = File(context.filesDir, "nexgo_last_crash.txt")
 
-/**
- * Guarda cualquier error no controlado en un archivo interno en vez de dejar que
- * el sistema simplemente cierre la app sin explicación. La próxima vez que se
- * abra la app, se muestra ese error en pantalla para poder diagnosticarlo.
- */
 private fun installCrashLogger(context: android.content.Context) {
     val previousHandler = Thread.getDefaultUncaughtExceptionHandler()
     Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -75,7 +72,6 @@ private fun installCrashLogger(context: android.content.Context) {
             throwable.printStackTrace(PrintWriter(sw))
             crashLogFile(context).writeText(sw.toString())
         } catch (_: Exception) {
-            // Si ni siquiera se puede guardar el log, no hay más remedio
         }
         previousHandler?.uncaughtException(thread, throwable)
     }
@@ -83,23 +79,28 @@ private fun installCrashLogger(context: android.content.Context) {
 
 private enum class LoginMode { XTREAM, M3U }
 
+/** Representa una pestaña de categoría, sea de Xtream (con id) o de M3U (id = nombre). */
+private data class GroupTab(val id: String, val name: String)
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun NexGoApp() {
     val context = LocalContext.current
     val db = remember { ChannelDatabase(context) }
     val m3uRepository = remember { PlaylistRepository(context, db) }
-    val xtreamRepository = remember { XtreamRepository(context, db) }
+    val xtreamRepository = remember { XtreamRepository(context) }
     val scope = rememberCoroutineScope()
 
-    // En vez de guardar TODOS los canales en memoria, solo guardamos la lista
-    // de grupos/categorías y los canales del grupo seleccionado (consultados
-    // a la base de datos SQLite bajo demanda).
-    var groups by remember { mutableStateOf<List<String>>(emptyList()) }
+    var loginMode by remember { mutableStateOf(LoginMode.XTREAM) }
+    var xtreamCredentials by remember { mutableStateOf<XtreamCredentials?>(null) }
+    var xtreamCategories by remember { mutableStateOf<List<XtreamCategory>>(emptyList()) }
+
+    var groupTabs by remember { mutableStateOf<List<GroupTab>>(emptyList()) }
     var channelsInGroup by remember { mutableStateOf<List<Channel>>(emptyList()) }
     var selectedChannel by remember { mutableStateOf<Channel?>(null) }
-    var selectedGroup by remember { mutableStateOf<String?>(null) }
+    var selectedGroupId by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
+    var isLoadingGroup by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showAddPlaylistDialog by remember { mutableStateOf(false) }
     var isFullscreen by remember { mutableStateOf(false) }
@@ -109,8 +110,6 @@ fun NexGoApp() {
         )
     }
 
-    // Campos del formulario de conexión
-    var loginMode by remember { mutableStateOf(LoginMode.XTREAM) }
     var serverUrlField by remember { mutableStateOf("") }
     var usernameField by remember { mutableStateOf("") }
     var passwordField by remember { mutableStateOf("") }
@@ -132,28 +131,37 @@ fun NexGoApp() {
 
     val exceptionHandler = remember {
         kotlinx.coroutines.CoroutineExceptionHandler { _, throwable ->
-            errorMessage = "Error de conexión: ${throwable.message ?: throwable.javaClass.simpleName}"
+            errorMessage = "Error: ${throwable.message ?: throwable.javaClass.simpleName}"
             isLoading = false
+            isLoadingGroup = false
         }
     }
 
-    // Trae de la base de datos solo los canales del grupo pedido (nunca todos a la vez)
-    suspend fun selectGroup(group: String?) {
-        selectedGroup = group
-        if (group == null) {
+    // Carga los canales de UNA pestaña puntual (Xtream: pide solo esa categoría al servidor;
+    // M3U: consulta la base de datos local, ya que ahí sí tenemos todo en un solo archivo).
+    fun selectGroupTab(tab: GroupTab) {
+        selectedGroupId = tab.id
+        scope.launch(exceptionHandler) {
+            isLoadingGroup = true
             channelsInGroup = emptyList()
             selectedChannel = null
-            return
+            try {
+                val loaded = when (loginMode) {
+                    LoginMode.XTREAM -> {
+                        val creds = xtreamCredentials ?: return@launch
+                        val category = xtreamCategories.find { it.id == tab.id } ?: return@launch
+                        xtreamRepository.loadChannelsForCategory(creds, category)
+                    }
+                    LoginMode.M3U -> withContext(Dispatchers.IO) { db.getChannels(tab.name) }
+                }
+                channelsInGroup = loaded
+                selectedChannel = loaded.firstOrNull()
+            } catch (e: Exception) {
+                errorMessage = e.message ?: "No se pudieron cargar los canales de esta categoría."
+            } finally {
+                isLoadingGroup = false
+            }
         }
-        val loaded = withContext(Dispatchers.IO) { db.getChannels(group) }
-        channelsInGroup = loaded
-        selectedChannel = loaded.firstOrNull()
-    }
-
-    suspend fun refreshGroupsAndSelectFirst() {
-        val loadedGroups = withContext(Dispatchers.IO) { db.getGroups() }
-        groups = loadedGroups
-        selectGroup(loadedGroups.firstOrNull())
     }
 
     fun loadWithXtream(credentials: XtreamCredentials, save: Boolean) {
@@ -161,10 +169,13 @@ fun NexGoApp() {
             isLoading = true
             errorMessage = null
             try {
-                xtreamRepository.loadChannels(credentials)
-                refreshGroupsAndSelectFirst()
+                val categories = xtreamRepository.loadCategories(credentials)
+                xtreamCredentials = credentials
+                xtreamCategories = categories
+                groupTabs = categories.map { GroupTab(it.id, it.name) }
                 if (save) xtreamRepository.saveCredentials(credentials)
                 showAddPlaylistDialog = false
+                groupTabs.firstOrNull()?.let { selectGroupTab(it) }
             } catch (e: Exception) {
                 errorMessage = e.message ?: "No se pudo conectar. Revisa servidor, usuario y contraseña."
             } finally {
@@ -179,9 +190,11 @@ fun NexGoApp() {
             errorMessage = null
             try {
                 m3uRepository.loadChannels(url)
-                refreshGroupsAndSelectFirst()
+                val loadedGroups = withContext(Dispatchers.IO) { db.getGroups() }
+                groupTabs = loadedGroups.map { GroupTab(it, it) }
                 if (save) m3uRepository.savePlaylistUrl(url)
                 showAddPlaylistDialog = false
+                groupTabs.firstOrNull()?.let { selectGroupTab(it) }
             } catch (e: Exception) {
                 errorMessage = "No se pudo cargar la lista. Revisa la URL o tu conexión."
             } finally {
@@ -190,16 +203,7 @@ fun NexGoApp() {
         }
     }
 
-    // Al iniciar: si ya hay canales guardados en la base de datos de una sesión
-    // anterior, los muestra de inmediato sin re-descargar nada. Si no hay nada
-    // guardado, intenta reconectar con las credenciales/URL guardadas.
     LaunchedEffect(Unit) {
-        val existingGroups = withContext(Dispatchers.IO) { db.getGroups() }
-        if (existingGroups.isNotEmpty()) {
-            groups = existingGroups
-            selectGroup(existingGroups.firstOrNull())
-        }
-
         val savedXtream = xtreamRepository.getSavedCredentials()
         val savedM3u = m3uRepository.getSavedPlaylistUrl()
         when {
@@ -208,14 +212,14 @@ fun NexGoApp() {
                 serverUrlField = savedXtream.serverUrl
                 usernameField = savedXtream.username
                 passwordField = savedXtream.password
-                if (existingGroups.isEmpty()) loadWithXtream(savedXtream, save = false)
+                loadWithXtream(savedXtream, save = false)
             }
             !savedM3u.isNullOrBlank() -> {
                 loginMode = LoginMode.M3U
                 m3uUrlField = savedM3u
-                if (existingGroups.isEmpty()) loadWithM3U(savedM3u, save = false)
+                loadWithM3U(savedM3u, save = false)
             }
-            existingGroups.isEmpty() -> {
+            else -> {
                 showAddPlaylistDialog = true
             }
         }
@@ -234,17 +238,18 @@ fun NexGoApp() {
             Column(modifier = Modifier.fillMaxSize()) {
                 TopBar(onAddPlaylistClick = { showAddPlaylistDialog = true })
 
-                if (groups.isNotEmpty()) {
+                if (groupTabs.isNotEmpty()) {
                     CategoryTabs(
-                        groups = groups,
-                        selected = selectedGroup,
-                        onSelect = { group -> scope.launch { selectGroup(group) } }
+                        tabs = groupTabs,
+                        selectedId = selectedGroupId,
+                        onSelect = { tab -> selectGroupTab(tab) }
                     )
                 }
 
                 Row(modifier = Modifier.fillMaxSize()) {
                     ChannelList(
                         channels = channelsInGroup,
+                        isLoading = isLoadingGroup,
                         selectedChannel = selectedChannel,
                         onChannelSelected = { selectedChannel = it },
                         onChannelDoubleClick = { channel ->
@@ -324,7 +329,7 @@ fun NexGoApp() {
                     LoginMode.M3U -> loadWithM3U(m3uUrlField, save = true)
                 }
             },
-            onDismiss = { if (groups.isNotEmpty()) showAddPlaylistDialog = false }
+            onDismiss = { if (groupTabs.isNotEmpty()) showAddPlaylistDialog = false }
         )
     }
 }
@@ -354,15 +359,11 @@ private fun TopBar(onAddPlaylistClick: () -> Unit) {
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun CategoryTabs(
-    groups: List<String>,
-    selected: String?,
-    onSelect: (String) -> Unit
+    tabs: List<GroupTab>,
+    selectedId: String?,
+    onSelect: (GroupTab) -> Unit
 ) {
-    // LazyRow en vez de ScrollableTabRow: con miles de categorías, ScrollableTabRow
-    // intenta componer TODAS las pestañas de una sola vez (aunque no se vean en
-    // pantalla), lo cual puede reventar la memoria. LazyRow solo dibuja las que
-    // están visibles, igual que hace la lista de canales.
-    androidx.compose.foundation.lazy.LazyRow(
+    LazyRow(
         modifier = Modifier
             .fillMaxWidth()
             .background(Color(0xFF0B1220))
@@ -370,17 +371,17 @@ private fun CategoryTabs(
         horizontalArrangement = Arrangement.spacedBy(8.dp),
         contentPadding = PaddingValues(horizontal = 16.dp)
     ) {
-        items(groups, key = { it }) { group ->
-            val isSelected = group == selected
+        items(tabs, key = { it.id }) { tab ->
+            val isSelected = tab.id == selectedId
             Box(
                 modifier = Modifier
                     .clip(RoundedCornerShape(20.dp))
                     .background(if (isSelected) Color(0xFF2FD3E0).copy(alpha = 0.18f) else Color(0xFF131C2E))
-                    .combinedClickable(onClick = { onSelect(group) }, onDoubleClick = {})
+                    .combinedClickable(onClick = { onSelect(tab) }, onDoubleClick = {})
                     .padding(horizontal = 16.dp, vertical = 8.dp)
             ) {
                 Text(
-                    text = group,
+                    text = tab.name,
                     color = if (isSelected) Color(0xFF2FD3E0) else Color(0xFF93A1B5),
                     fontSize = 14.sp,
                     fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
@@ -394,6 +395,7 @@ private fun CategoryTabs(
 @Composable
 private fun ChannelList(
     channels: List<Channel>,
+    isLoading: Boolean,
     selectedChannel: Channel?,
     onChannelSelected: (Channel) -> Unit,
     onChannelDoubleClick: (Channel) -> Unit,
@@ -405,21 +407,27 @@ private fun ChannelList(
             color = Color(0xFF93A1B5),
             modifier = Modifier.padding(16.dp)
         )
-        if (channels.isEmpty()) {
-            Text(
+        when {
+            isLoading -> Text(
+                text = "Cargando canales…",
+                color = Color(0xFF93A1B5),
+                modifier = Modifier.padding(16.dp)
+            )
+            channels.isEmpty() -> Text(
                 text = stringResource(R.string.no_channels),
                 color = Color(0xFF93A1B5),
                 modifier = Modifier.padding(16.dp)
             )
-        } else {
-            LazyColumn {
-                items(channels, key = { it.id }) { channel ->
-                    ChannelRow(
-                        channel = channel,
-                        isSelected = channel.id == selectedChannel?.id,
-                        onClick = { onChannelSelected(channel) },
-                        onDoubleClick = { onChannelDoubleClick(channel) }
-                    )
+            else -> {
+                LazyColumn {
+                    items(channels, key = { it.id }) { channel ->
+                        ChannelRow(
+                            channel = channel,
+                            isSelected = channel.id == selectedChannel?.id,
+                            onClick = { onChannelSelected(channel) },
+                            onDoubleClick = { onChannelDoubleClick(channel) }
+                        )
+                    }
                 }
             }
         }
