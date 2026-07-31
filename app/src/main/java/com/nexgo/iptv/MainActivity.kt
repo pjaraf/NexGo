@@ -122,8 +122,15 @@ fun NexGoApp() {
 
     BackHandler(enabled = isFullscreen) { isFullscreen = false }
 
+    val exceptionHandler = remember {
+        kotlinx.coroutines.CoroutineExceptionHandler { _, throwable ->
+            errorMessage = "Error de conexión: ${throwable.message ?: throwable.javaClass.simpleName}"
+            isLoading = false
+        }
+    }
+
     fun loadWithXtream(credentials: XtreamCredentials, save: Boolean) {
-        scope.launch {
+        scope.launch(exceptionHandler) {
             isLoading = true
             errorMessage = null
             try {
@@ -142,7 +149,7 @@ fun NexGoApp() {
     }
 
     fun loadWithM3U(url: String, save: Boolean) {
-        scope.launch {
+        scope.launch(exceptionHandler) {
             isLoading = true
             errorMessage = null
             try {
