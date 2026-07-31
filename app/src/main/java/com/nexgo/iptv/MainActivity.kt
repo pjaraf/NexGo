@@ -37,12 +37,15 @@ import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import com.nexgo.iptv.data.ChannelDatabase
 import com.nexgo.iptv.data.PlaylistRepository
 import com.nexgo.iptv.data.XtreamCredentials
 import com.nexgo.iptv.data.XtreamRepository
 import com.nexgo.iptv.model.Channel
 import com.nexgo.iptv.ui.theme.NexGoTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -84,11 +87,16 @@ private enum class LoginMode { XTREAM, M3U }
 @Composable
 fun NexGoApp() {
     val context = LocalContext.current
-    val m3uRepository = remember { PlaylistRepository(context) }
-    val xtreamRepository = remember { XtreamRepository(context) }
+    val db = remember { ChannelDatabase(context) }
+    val m3uRepository = remember { PlaylistRepository(context, db) }
+    val xtreamRepository = remember { XtreamRepository(context, db) }
     val scope = rememberCoroutineScope()
 
-    var channels by remember { mutableStateOf<List<Channel>>(emptyList()) }
+    // En vez de guardar TODOS los canales en memoria, solo guardamos la lista
+    // de grupos/categorías y los canales del grupo seleccionado (consultados
+    // a la base de datos SQLite bajo demanda).
+    var groups by remember { mutableStateOf<List<String>>(emptyList()) }
+    var channelsInGroup by remember { mutableStateOf<List<Channel>>(emptyList()) }
     var selectedChannel by remember { mutableStateOf<Channel?>(null) }
     var selectedGroup by remember { mutableStateOf<String?>(null) }
     var isLoading by remember { mutableStateOf(false) }
@@ -129,15 +137,32 @@ fun NexGoApp() {
         }
     }
 
+    // Trae de la base de datos solo los canales del grupo pedido (nunca todos a la vez)
+    suspend fun selectGroup(group: String?) {
+        selectedGroup = group
+        if (group == null) {
+            channelsInGroup = emptyList()
+            selectedChannel = null
+            return
+        }
+        val loaded = withContext(Dispatchers.IO) { db.getChannels(group) }
+        channelsInGroup = loaded
+        selectedChannel = loaded.firstOrNull()
+    }
+
+    suspend fun refreshGroupsAndSelectFirst() {
+        val loadedGroups = withContext(Dispatchers.IO) { db.getGroups() }
+        groups = loadedGroups
+        selectGroup(loadedGroups.firstOrNull())
+    }
+
     fun loadWithXtream(credentials: XtreamCredentials, save: Boolean) {
         scope.launch(exceptionHandler) {
             isLoading = true
             errorMessage = null
             try {
-                val loaded = xtreamRepository.loadChannels(credentials)
-                channels = loaded
-                selectedChannel = loaded.firstOrNull()
-                selectedGroup = loaded.firstOrNull()?.group
+                xtreamRepository.loadChannels(credentials)
+                refreshGroupsAndSelectFirst()
                 if (save) xtreamRepository.saveCredentials(credentials)
                 showAddPlaylistDialog = false
             } catch (e: Exception) {
@@ -153,10 +178,8 @@ fun NexGoApp() {
             isLoading = true
             errorMessage = null
             try {
-                val loaded = m3uRepository.loadChannels(url)
-                channels = loaded
-                selectedChannel = loaded.firstOrNull()
-                selectedGroup = loaded.firstOrNull()?.group
+                m3uRepository.loadChannels(url)
+                refreshGroupsAndSelectFirst()
                 if (save) m3uRepository.savePlaylistUrl(url)
                 showAddPlaylistDialog = false
             } catch (e: Exception) {
@@ -167,8 +190,16 @@ fun NexGoApp() {
         }
     }
 
-    // Al iniciar, intenta reconectar con lo último guardado (primero Xtream, luego M3U)
+    // Al iniciar: si ya hay canales guardados en la base de datos de una sesión
+    // anterior, los muestra de inmediato sin re-descargar nada. Si no hay nada
+    // guardado, intenta reconectar con las credenciales/URL guardadas.
     LaunchedEffect(Unit) {
+        val existingGroups = withContext(Dispatchers.IO) { db.getGroups() }
+        if (existingGroups.isNotEmpty()) {
+            groups = existingGroups
+            selectGroup(existingGroups.firstOrNull())
+        }
+
         val savedXtream = xtreamRepository.getSavedCredentials()
         val savedM3u = m3uRepository.getSavedPlaylistUrl()
         when {
@@ -177,14 +208,14 @@ fun NexGoApp() {
                 serverUrlField = savedXtream.serverUrl
                 usernameField = savedXtream.username
                 passwordField = savedXtream.password
-                loadWithXtream(savedXtream, save = false)
+                if (existingGroups.isEmpty()) loadWithXtream(savedXtream, save = false)
             }
             !savedM3u.isNullOrBlank() -> {
                 loginMode = LoginMode.M3U
                 m3uUrlField = savedM3u
-                loadWithM3U(savedM3u, save = false)
+                if (existingGroups.isEmpty()) loadWithM3U(savedM3u, save = false)
             }
-            else -> {
+            existingGroups.isEmpty() -> {
                 showAddPlaylistDialog = true
             }
         }
@@ -203,18 +234,17 @@ fun NexGoApp() {
             Column(modifier = Modifier.fillMaxSize()) {
                 TopBar(onAddPlaylistClick = { showAddPlaylistDialog = true })
 
-                val groups = remember(channels) { channels.map { it.group }.distinct() }
                 if (groups.isNotEmpty()) {
                     CategoryTabs(
                         groups = groups,
                         selected = selectedGroup,
-                        onSelect = { selectedGroup = it }
+                        onSelect = { group -> scope.launch { selectGroup(group) } }
                     )
                 }
 
                 Row(modifier = Modifier.fillMaxSize()) {
                     ChannelList(
-                        channels = channels.filter { selectedGroup == null || it.group == selectedGroup },
+                        channels = channelsInGroup,
                         selectedChannel = selectedChannel,
                         onChannelSelected = { selectedChannel = it },
                         onChannelDoubleClick = { channel ->
@@ -294,7 +324,7 @@ fun NexGoApp() {
                     LoginMode.M3U -> loadWithM3U(m3uUrlField, save = true)
                 }
             },
-            onDismiss = { if (channels.isNotEmpty()) showAddPlaylistDialog = false }
+            onDismiss = { if (groups.isNotEmpty()) showAddPlaylistDialog = false }
         )
     }
 }
@@ -508,8 +538,6 @@ private fun VideoPlayer(streamUrl: String) {
                 playerView.player = exoPlayer
                 playerView
             } catch (e: Exception) {
-                // Respaldo si el layout no cargó bien: reproductor básico sin ese XML,
-                // así la app no se cierra aunque el video se vea sin recorte de esquinas.
                 PlayerView(ctx).apply {
                     player = exoPlayer
                     useController = true
