@@ -5,9 +5,10 @@ import java.io.Reader
 
 /**
  * Parser en streaming para listas M3U/M3U8 con extensión EXTINF (formato IPTV
- * estándar). Lee línea por línea directo desde la conexión de red, en vez de
- * cargar el archivo completo en un solo String gigante primero (importante
- * para listas de decenas de miles de canales, para no quedarse sin memoria).
+ * estándar). Lee línea por línea directo desde la conexión de red y entrega
+ * los canales en BLOQUES PEQUEÑOS mediante onBatch, en vez de acumular una
+ * lista gigante en memoria. Así, listas de cientos de miles de canales no
+ * revientan la RAM: cada bloque se guarda en disco (SQLite) y se descarta.
  *
  * Ejemplo de entrada soportada:
  *
@@ -18,13 +19,14 @@ import java.io.Reader
 object M3UParser {
 
     private val attrRegex = Regex("""([a-zA-Z-]+)="([^"]*)"""")
+    private const val BATCH_SIZE = 300
 
-    fun parse(reader: Reader): List<Channel> {
-        val channels = mutableListOf<Channel>()
+    fun parse(reader: Reader, onBatch: (List<Channel>) -> Unit): Int {
+        val batch = mutableListOf<Channel>()
         var pendingName: String? = null
         var pendingGroup = "General"
         var pendingLogo: String? = null
-        var autoId = 0
+        var totalCount = 0
 
         reader.forEachLine { rawLine ->
             val line = rawLine.trim()
@@ -36,16 +38,16 @@ object M3UParser {
                     val attrs = attrRegex.findAll(line).associate { it.groupValues[1] to it.groupValues[2] }
                     pendingGroup = attrs["group-title"]?.takeIf { it.isNotBlank() } ?: "General"
                     pendingLogo = attrs["tvg-logo"]
-                    pendingName = line.substringAfterLast(",").trim().ifBlank { "Canal ${autoId + 1}" }
+                    pendingName = line.substringAfterLast(",").trim().ifBlank { "Canal ${totalCount + 1}" }
                 }
 
                 line.startsWith("#") -> Unit
 
                 else -> {
-                    val name = pendingName ?: "Canal ${autoId + 1}"
-                    autoId += 1
-                    channels += Channel(
-                        id = autoId.toString(),
+                    val name = pendingName ?: "Canal ${totalCount + 1}"
+                    totalCount += 1
+                    batch += Channel(
+                        id = totalCount.toString(),
                         name = name,
                         group = pendingGroup,
                         logoUrl = pendingLogo,
@@ -54,10 +56,19 @@ object M3UParser {
                     pendingName = null
                     pendingLogo = null
                     pendingGroup = "General"
+
+                    if (batch.size >= BATCH_SIZE) {
+                        onBatch(batch.toList())
+                        batch.clear()
+                    }
                 }
             }
         }
 
-        return channels
+        if (batch.isNotEmpty()) {
+            onBatch(batch.toList())
+        }
+
+        return totalCount
     }
                                   }
