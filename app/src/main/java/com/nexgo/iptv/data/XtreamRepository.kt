@@ -1,6 +1,8 @@
 package com.nexgo.iptv.data
 
 import android.content.Context
+import android.util.JsonReader
+import android.util.JsonToken
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -10,7 +12,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import org.json.JSONArray
+import java.util.concurrent.TimeUnit
 
 private val Context.xtreamDataStore by preferencesDataStore(name = "nexgo_xtream_prefs")
 private val SERVER_KEY = stringPreferencesKey("xtream_server")
@@ -26,12 +28,20 @@ data class XtreamCredentials(
 /**
  * Cliente para paneles IPTV tipo "Xtream Codes": conecta con usuario + contraseña +
  * URL del servidor y trae la lista de canales en vivo vía su API JSON
- * (player_api.php), lo cual es mucho más rápido que descargar y parsear un M3U
- * completo cada vez.
+ * (player_api.php).
+ *
+ * IMPORTANTE: algunos paneles tienen decenas de miles de canales, y el JSON puede
+ * pesar varios MB. Por eso NO se carga la respuesta completa en un solo String
+ * (eso duplica/triplica el uso de memoria y puede tirar OutOfMemoryError). En vez
+ * de eso, se parsea en "streaming" con JsonReader, token por token, directo desde
+ * la conexión de red.
  */
 class XtreamRepository(private val context: Context) {
 
-    private val client = OkHttpClient()
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .build()
 
     suspend fun getSavedCredentials(): XtreamCredentials? {
         val prefs = context.xtreamDataStore.data.first()
@@ -68,47 +78,89 @@ class XtreamRepository(private val context: Context) {
         val user = credentials.username.trim()
         val pass = credentials.password.trim()
 
-        // 1) Validar servidor/credenciales
+        // 1) Validar servidor/credenciales con una petición liviana
         val authUrl = "$base/player_api.php?username=$user&password=$pass"
-        val authBody = fetch(authUrl)
-        if (authBody.isBlank() || !authBody.trimStart().startsWith("{")) {
-            throw IllegalStateException("Servidor o credenciales inválidas")
+        val authRequest = Request.Builder().url(authUrl).build()
+        client.newCall(authRequest).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("Servidor o credenciales inválidas (HTTP ${response.code})")
+            }
         }
 
-        // 2) Categorías, para agrupar los canales igual que el "group-title" de un M3U
-        val categoriesUrl = "$base/player_api.php?username=$user&password=$pass&action=get_live_categories"
+        // 2) Categorías (para agrupar), en streaming
         val categoryNames = mutableMapOf<String, String>()
         try {
-            val categoriesJson = JSONArray(fetch(categoriesUrl))
-            for (i in 0 until categoriesJson.length()) {
-                val cat = categoriesJson.getJSONObject(i)
-                categoryNames[cat.optString("category_id")] = cat.optString("category_name", "General")
+            val categoriesUrl = "$base/player_api.php?username=$user&password=$pass&action=get_live_categories"
+            val request = Request.Builder().url(categoriesUrl).build()
+            client.newCall(request).execute().use { response ->
+                if (response.isSuccessful) {
+                    response.body?.charStream()?.use { stream ->
+                        JsonReader(stream).use { reader ->
+                            reader.beginArray()
+                            while (reader.hasNext()) {
+                                reader.beginObject()
+                                var id: String? = null
+                                var name: String? = null
+                                while (reader.hasNext()) {
+                                    when (reader.nextName()) {
+                                        "category_id" -> id = reader.nextFlexibleString()
+                                        "category_name" -> name = reader.nextFlexibleString()
+                                        else -> reader.skipValue()
+                                    }
+                                }
+                                reader.endObject()
+                                if (id != null) categoryNames[id] = name ?: "General"
+                            }
+                            reader.endArray()
+                        }
+                    }
+                }
             }
         } catch (_: Exception) {
             // Si el panel no expone categorías, seguimos sin agrupar
         }
 
-        // 3) Canales en vivo
+        // 3) Canales en vivo, en streaming (esta es la parte que puede ser enorme)
         val streamsUrl = "$base/player_api.php?username=$user&password=$pass&action=get_live_streams"
-        val streamsJson = JSONArray(fetch(streamsUrl))
+        val streamsRequest = Request.Builder().url(streamsUrl).build()
         val channels = mutableListOf<Channel>()
-        for (i in 0 until streamsJson.length()) {
-            val item = streamsJson.getJSONObject(i)
-            val streamId = item.optString("stream_id")
-            if (streamId.isBlank()) continue
-            val categoryId = item.optString("category_id")
-            val name = item.optString("name", "Canal $streamId")
-            val logo = item.optString("stream_icon").takeIf { it.isNotBlank() }
-            val group = categoryNames[categoryId] ?: "General"
-            val streamUrl = "$base/live/$user/$pass/$streamId.m3u8"
-
-            channels += Channel(
-                id = streamId,
-                name = name,
-                group = group,
-                logoUrl = logo,
-                streamUrl = streamUrl
-            )
+        client.newCall(streamsRequest).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("HTTP ${response.code} al pedir los canales")
+            }
+            val body = response.body ?: throw IllegalStateException("Respuesta vacía")
+            body.charStream().use { stream ->
+                JsonReader(stream).use { reader ->
+                    reader.beginArray()
+                    while (reader.hasNext()) {
+                        reader.beginObject()
+                        var streamId: String? = null
+                        var name: String? = null
+                        var categoryId: String? = null
+                        var logo: String? = null
+                        while (reader.hasNext()) {
+                            when (reader.nextName()) {
+                                "stream_id" -> streamId = reader.nextFlexibleString()
+                                "name" -> name = reader.nextFlexibleString()
+                                "category_id" -> categoryId = reader.nextFlexibleString()
+                                "stream_icon" -> logo = reader.nextFlexibleString()
+                                else -> reader.skipValue()
+                            }
+                        }
+                        reader.endObject()
+                        if (!streamId.isNullOrBlank()) {
+                            channels += Channel(
+                                id = streamId,
+                                name = name ?: "Canal $streamId",
+                                group = categoryNames[categoryId] ?: "General",
+                                logoUrl = logo,
+                                streamUrl = "$base/live/$user/$pass/$streamId.m3u8"
+                            )
+                        }
+                    }
+                    reader.endArray()
+                }
+            }
         }
 
         if (channels.isEmpty()) {
@@ -117,14 +169,18 @@ class XtreamRepository(private val context: Context) {
 
         channels
     }
+}
 
-    private fun fetch(url: String): String {
-        val request = Request.Builder().url(url).build()
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) {
-                throw IllegalStateException("HTTP ${response.code}")
-            }
-            return response.body?.string() ?: ""
+/**
+ * Lee el siguiente valor como String sin importar si el panel lo mandó como
+ * texto, número o null (algunos paneles Xtream son inconsistentes con esto).
+ */
+private fun JsonReader.nextFlexibleString(): String? {
+    return when (peek()) {
+        JsonToken.NULL -> {
+            nextNull()
+            null
         }
+        else -> nextString()
     }
 }
