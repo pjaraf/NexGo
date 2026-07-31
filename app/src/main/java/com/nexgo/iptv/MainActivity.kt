@@ -22,6 +22,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
@@ -32,6 +33,8 @@ import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.nexgo.iptv.data.PlaylistRepository
+import com.nexgo.iptv.data.XtreamCredentials
+import com.nexgo.iptv.data.XtreamRepository
 import com.nexgo.iptv.model.Channel
 import com.nexgo.iptv.ui.theme.NexGoTheme
 import kotlinx.coroutines.launch
@@ -48,11 +51,14 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private enum class LoginMode { XTREAM, M3U }
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun NexGoApp() {
     val context = LocalContext.current
-    val repository = remember { PlaylistRepository(context) }
+    val m3uRepository = remember { PlaylistRepository(context) }
+    val xtreamRepository = remember { XtreamRepository(context) }
     val scope = rememberCoroutineScope()
 
     var channels by remember { mutableStateOf<List<Channel>>(emptyList()) }
@@ -61,8 +67,14 @@ fun NexGoApp() {
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showAddPlaylistDialog by remember { mutableStateOf(false) }
-    var playlistUrlField by remember { mutableStateOf("") }
     var isFullscreen by remember { mutableStateOf(false) }
+
+    // Campos del formulario de conexión
+    var loginMode by remember { mutableStateOf(LoginMode.XTREAM) }
+    var serverUrlField by remember { mutableStateOf("") }
+    var usernameField by remember { mutableStateOf("") }
+    var passwordField by remember { mutableStateOf("") }
+    var m3uUrlField by remember { mutableStateOf("") }
 
     val activity = context as? ComponentActivity
     LaunchedEffect(isFullscreen) {
@@ -78,41 +90,63 @@ fun NexGoApp() {
 
     BackHandler(enabled = isFullscreen) { isFullscreen = false }
 
-    LaunchedEffect(Unit) {
-        val savedUrl = repository.getSavedPlaylistUrl()
-        if (!savedUrl.isNullOrBlank()) {
-            playlistUrlField = savedUrl
-            isLoading = true
-            try {
-                val loaded = repository.loadChannels(savedUrl)
-                channels = loaded
-                selectedChannel = loaded.firstOrNull()
-                selectedGroup = loaded.firstOrNull()?.group
-            } catch (e: Exception) {
-                errorMessage = e.message
-            } finally {
-                isLoading = false
-            }
-        } else {
-            showAddPlaylistDialog = true
-        }
-    }
-
-    fun loadPlaylist(url: String) {
+    fun loadWithXtream(credentials: XtreamCredentials, save: Boolean) {
         scope.launch {
             isLoading = true
             errorMessage = null
             try {
-                val loaded = repository.loadChannels(url)
+                val loaded = xtreamRepository.loadChannels(credentials)
                 channels = loaded
                 selectedChannel = loaded.firstOrNull()
                 selectedGroup = loaded.firstOrNull()?.group
-                repository.savePlaylistUrl(url)
+                if (save) xtreamRepository.saveCredentials(credentials)
+                showAddPlaylistDialog = false
+            } catch (e: Exception) {
+                errorMessage = e.message ?: "No se pudo conectar. Revisa servidor, usuario y contraseña."
+            } finally {
+                isLoading = false
+            }
+        }
+    }
+
+    fun loadWithM3U(url: String, save: Boolean) {
+        scope.launch {
+            isLoading = true
+            errorMessage = null
+            try {
+                val loaded = m3uRepository.loadChannels(url)
+                channels = loaded
+                selectedChannel = loaded.firstOrNull()
+                selectedGroup = loaded.firstOrNull()?.group
+                if (save) m3uRepository.savePlaylistUrl(url)
                 showAddPlaylistDialog = false
             } catch (e: Exception) {
                 errorMessage = "No se pudo cargar la lista. Revisa la URL o tu conexión."
             } finally {
                 isLoading = false
+            }
+        }
+    }
+
+    // Al iniciar, intenta reconectar con lo último guardado (primero Xtream, luego M3U)
+    LaunchedEffect(Unit) {
+        val savedXtream = xtreamRepository.getSavedCredentials()
+        val savedM3u = m3uRepository.getSavedPlaylistUrl()
+        when {
+            savedXtream != null -> {
+                loginMode = LoginMode.XTREAM
+                serverUrlField = savedXtream.serverUrl
+                usernameField = savedXtream.username
+                passwordField = savedXtream.password
+                loadWithXtream(savedXtream, save = false)
+            }
+            !savedM3u.isNullOrBlank() -> {
+                loginMode = LoginMode.M3U
+                m3uUrlField = savedM3u
+                loadWithM3U(savedM3u, save = false)
+            }
+            else -> {
+                showAddPlaylistDialog = true
             }
         }
     }
@@ -168,9 +202,27 @@ fun NexGoApp() {
 
     if (showAddPlaylistDialog) {
         AddPlaylistDialog(
-            urlValue = playlistUrlField,
-            onUrlChange = { playlistUrlField = it },
-            onConfirm = { loadPlaylist(playlistUrlField) },
+            mode = loginMode,
+            onModeChange = { loginMode = it },
+            serverUrl = serverUrlField,
+            onServerUrlChange = { serverUrlField = it },
+            username = usernameField,
+            onUsernameChange = { usernameField = it },
+            password = passwordField,
+            onPasswordChange = { passwordField = it },
+            m3uUrl = m3uUrlField,
+            onM3uUrlChange = { m3uUrlField = it },
+            isLoading = isLoading,
+            errorMessage = errorMessage,
+            onConfirm = {
+                when (loginMode) {
+                    LoginMode.XTREAM -> loadWithXtream(
+                        XtreamCredentials(serverUrlField, usernameField, passwordField),
+                        save = true
+                    )
+                    LoginMode.M3U -> loadWithM3U(m3uUrlField, save = true)
+                }
+            },
             onDismiss = { if (channels.isNotEmpty()) showAddPlaylistDialog = false }
         )
     }
@@ -193,7 +245,7 @@ private fun TopBar(onAddPlaylistClick: () -> Unit) {
             fontWeight = FontWeight.Bold
         )
         TextButton(onClick = onAddPlaylistClick) {
-            Text(stringResource(R.string.add_playlist), color = Color(0xFFF5F7FA))
+            Text("Conectar cuenta", color = Color(0xFFF5F7FA))
         }
     }
 }
@@ -371,25 +423,87 @@ private fun VideoPlayer(streamUrl: String) {
 
 @Composable
 private fun AddPlaylistDialog(
-    urlValue: String,
-    onUrlChange: (String) -> Unit,
+    mode: LoginMode,
+    onModeChange: (LoginMode) -> Unit,
+    serverUrl: String,
+    onServerUrlChange: (String) -> Unit,
+    username: String,
+    onUsernameChange: (String) -> Unit,
+    password: String,
+    onPasswordChange: (String) -> Unit,
+    m3uUrl: String,
+    onM3uUrlChange: (String) -> Unit,
+    isLoading: Boolean,
+    errorMessage: String?,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.add_playlist)) },
+        title = { Text("Conectar cuenta IPTV") },
         text = {
-            OutlinedTextField(
-                value = urlValue,
-                onValueChange = onUrlChange,
-                label = { Text(stringResource(R.string.playlist_url_hint)) },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
+            Column {
+                Row(modifier = Modifier.fillMaxWidth()) {
+                    FilterChip(
+                        selected = mode == LoginMode.XTREAM,
+                        onClick = { onModeChange(LoginMode.XTREAM) },
+                        label = { Text("Usuario y contraseña") }
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    FilterChip(
+                        selected = mode == LoginMode.M3U,
+                        onClick = { onModeChange(LoginMode.M3U) },
+                        label = { Text("Lista M3U") }
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                if (mode == LoginMode.XTREAM) {
+                    OutlinedTextField(
+                        value = serverUrl,
+                        onValueChange = onServerUrlChange,
+                        label = { Text("URL del servidor (ej: http://servidor.com:8080)") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = username,
+                        onValueChange = onUsernameChange,
+                        label = { Text("Usuario") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = onPasswordChange,
+                        label = { Text("Contraseña") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = m3uUrl,
+                        onValueChange = onM3uUrlChange,
+                        label = { Text(stringResource(R.string.playlist_url_hint)) },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                if (errorMessage != null) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(errorMessage, color = Color(0xFFFF6B6B), fontSize = 13.sp)
+                }
+            }
         },
         confirmButton = {
-            TextButton(onClick = onConfirm) { Text(stringResource(R.string.load)) }
+            TextButton(onClick = onConfirm, enabled = !isLoading) {
+                Text(if (isLoading) "Conectando…" else "Conectar")
+            }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text("Cancelar") }
